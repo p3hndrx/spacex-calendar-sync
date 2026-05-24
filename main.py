@@ -1,21 +1,24 @@
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import datetime, timedelta
 
-import functions_framework
 import requests
 from google.auth import default as google_auth_default
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
 SPACEX_API_URL = "https://api.spacexdata.com/v5/launches/query"
 CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# Default event duration when no launch window is provided (2 hours)
 DEFAULT_WINDOW_SECONDS = 7200
 
 
@@ -25,7 +28,6 @@ def get_calendar_service():
 
 
 def fetch_upcoming_launches() -> list[dict]:
-    """Fetch all upcoming SpaceX launches with rocket and launchpad details populated."""
     payload = {
         "query": {"upcoming": True},
         "options": {
@@ -44,14 +46,12 @@ def fetch_upcoming_launches() -> list[dict]:
     resp = requests.post(SPACEX_API_URL, json=payload, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    # API returns {"docs": [...]} when pagination=False is honoured, or the raw list
     if isinstance(data, dict):
         return data.get("docs", [])
     return data
 
 
 def get_existing_spacex_events(service) -> dict[str, dict]:
-    """Return a map of {spacex_id: calendar_event} for all events we previously created."""
     events: dict[str, dict] = {}
     page_token = None
     while True:
@@ -166,7 +166,6 @@ def build_event(launch: dict) -> dict:
         )
         end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "timeZone": "UTC"}
     else:
-        # day / month / quarter / half / year — use an all-day event
         date_only = date_utc[:10]
         start = {"date": date_only}
         end_date = (
@@ -192,53 +191,50 @@ def build_event(launch: dict) -> dict:
     return event
 
 
-@functions_framework.http
-def sync_launches(request):
+def sync_launches():
     logger.info("SpaceX calendar sync started")
 
-    try:
-        service = get_calendar_service()
-        launches = fetch_upcoming_launches()
-        existing = get_existing_spacex_events(service)
-        logger.info(
-            f"Fetched {len(launches)} upcoming launches; "
-            f"{len(existing)} events already in calendar"
-        )
+    service = get_calendar_service()
+    launches = fetch_upcoming_launches()
+    existing = get_existing_spacex_events(service)
+    logger.info(
+        f"Fetched {len(launches)} upcoming launches; "
+        f"{len(existing)} events already in calendar"
+    )
 
-        created = updated = errors = 0
+    created = updated = errors = 0
 
-        for launch in launches:
-            try:
-                event = build_event(launch)
-                spacex_id = launch["id"]
+    for launch in launches:
+        try:
+            event = build_event(launch)
+            spacex_id = launch["id"]
 
-                if spacex_id in existing:
-                    service.events().patch(
-                        calendarId=CALENDAR_ID,
-                        eventId=existing[spacex_id]["id"],
-                        body=event,
-                    ).execute()
-                    updated += 1
-                    logger.info(f"Updated: {launch['name']}")
-                else:
-                    service.events().insert(
-                        calendarId=CALENDAR_ID,
-                        body=event,
-                    ).execute()
-                    created += 1
-                    logger.info(f"Created: {launch['name']}")
+            if spacex_id in existing:
+                service.events().patch(
+                    calendarId=CALENDAR_ID,
+                    eventId=existing[spacex_id]["id"],
+                    body=event,
+                ).execute()
+                updated += 1
+                logger.info(f"Updated:  {launch['name']}")
+            else:
+                service.events().insert(
+                    calendarId=CALENDAR_ID,
+                    body=event,
+                ).execute()
+                created += 1
+                logger.info(f"Created:  {launch['name']}")
 
-            except HttpError as e:
-                logger.error(f"Calendar API error for {launch.get('name')}: {e}")
-                errors += 1
-            except Exception as e:
-                logger.error(f"Unexpected error for {launch.get('name')}: {e}")
-                errors += 1
+        except HttpError as e:
+            logger.error(f"Calendar API error for {launch.get('name')}: {e}")
+            errors += 1
+        except Exception as e:
+            logger.error(f"Unexpected error for {launch.get('name')}: {e}")
+            errors += 1
 
-        summary = f"Sync complete — created: {created}, updated: {updated}, errors: {errors}"
-        logger.info(summary)
-        return summary, 200
+    logger.info(f"Sync complete — created: {created}, updated: {updated}, errors: {errors}")
+    return errors
 
-    except Exception as e:
-        logger.exception("Fatal error during sync")
-        return f"Error: {e}", 500
+
+if __name__ == "__main__":
+    sys.exit(sync_launches())
