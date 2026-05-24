@@ -5,7 +5,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
-LOG_FILE="$SCRIPT_DIR/sync.log"
 
 # ── 1. Create a Python virtual environment ────────────────────────────────────
 echo "==> Creating virtual environment..."
@@ -14,36 +13,40 @@ python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" -q
 echo "    Done — $(${VENV_DIR}/bin/python --version)"
 
-# ── 2. Check for .env ─────────────────────────────────────────────────────────
+# ── 2. Create .env if missing ─────────────────────────────────────────────────
 if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
     cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+    # Patch credentials path to the absolute location for this installation
+    sed -i "s|GOOGLE_APPLICATION_CREDENTIALS=.*|GOOGLE_APPLICATION_CREDENTIALS=${SCRIPT_DIR}/service-account-key.json|" "$SCRIPT_DIR/.env"
     echo ""
-    echo "ACTION REQUIRED: Edit .env and fill in your values:"
+    echo "ACTION REQUIRED: Edit .env and set your calendar ID:"
     echo "  $SCRIPT_DIR/.env"
     echo ""
     echo "  GOOGLE_CALENDAR_ID           — your SpaceX calendar ID"
-    echo "  GOOGLE_APPLICATION_CREDENTIALS — full path to your service account key JSON"
+    echo "  GOOGLE_APPLICATION_CREDENTIALS — already set to ${SCRIPT_DIR}/service-account-key.json"
+    echo "                                   (drop the JSON key file there)"
     echo ""
 fi
 
-# ── 3. Test the script manually before setting up cron ───────────────────────
-echo "==> Running a test sync (check output for errors)..."
-set -o allexport; source "$SCRIPT_DIR/.env"; set +o allexport
-"$VENV_DIR/bin/python" "$SCRIPT_DIR/main.py"
+# ── 3. Make run.sh executable ─────────────────────────────────────────────────
+chmod +x "$SCRIPT_DIR/run.sh"
 
-# ── 4. Install the cron job ───────────────────────────────────────────────────
+# ── 4. Test the script manually before setting up cron ───────────────────────
+echo "==> Running a test sync (check output for errors)..."
+"$SCRIPT_DIR/run.sh"
+
+# ── 5. Install the cron job ───────────────────────────────────────────────────
 # Runs daily at 06:00 server time. Edit the schedule as needed.
 CRON_SCHEDULE="0 6 * * *"
-CRON_CMD="$CRON_SCHEDULE cd $SCRIPT_DIR && set -o allexport && source .env && set +o allexport && $VENV_DIR/bin/python main.py >> $LOG_FILE 2>&1"
+CRON_CMD="$CRON_SCHEDULE $SCRIPT_DIR/run.sh"
 
 echo ""
 echo "==> Installing cron job..."
-# Append only if the line isn't already there
-(crontab -l 2>/dev/null | grep -qF "$SCRIPT_DIR/main.py") \
+(crontab -l 2>/dev/null | grep -qF "$SCRIPT_DIR/run.sh") \
     && echo "    Cron job already exists, skipping." \
     || (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
 
 echo "    Installed: $CRON_SCHEDULE"
 echo ""
 echo "Verify with:  crontab -l"
-echo "Watch logs:   tail -f $LOG_FILE"
+echo "Watch logs:   tail -f $SCRIPT_DIR/logs/sync.log"

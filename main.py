@@ -2,23 +2,36 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import requests
 from google.auth import default as google_auth_default
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    stream=sys.stdout,
-)
+# ── Logging — stdout + rotating file ─────────────────────────────────────────
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+_root.addHandler(_sh)
+
+_fh = RotatingFileHandler(_log_dir / "sync.log", maxBytes=1_000_000, backupCount=3)
+_fh.setFormatter(_fmt)
+_root.addHandler(_fh)
+
 logger = logging.getLogger(__name__)
 
+# ── Config ────────────────────────────────────────────────────────────────────
 SPACEX_API_URL = "https://api.spacexdata.com/v5/launches/query"
 CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
 DEFAULT_WINDOW_SECONDS = 7200
 
 
@@ -202,7 +215,7 @@ def sync_launches():
         f"{len(existing)} events already in calendar"
     )
 
-    created = updated = errors = 0
+    created = updated = deleted = errors = 0
 
     for launch in launches:
         try:
@@ -232,7 +245,31 @@ def sync_launches():
             logger.error(f"Unexpected error for {launch.get('name')}: {e}")
             errors += 1
 
-    logger.info(f"Sync complete — created: {created}, updated: {updated}, errors: {errors}")
+    # Remove calendar events for launches no longer in the upcoming list
+    # (cancelled, scrubbed, or already flown and dropped from the API).
+    # Guard against mass-deletion if the API returned nothing.
+    if launches:
+        fetched_ids = {launch["id"] for launch in launches}
+        for spacex_id, event in existing.items():
+            if spacex_id not in fetched_ids:
+                try:
+                    service.events().delete(
+                        calendarId=CALENDAR_ID,
+                        eventId=event["id"],
+                    ).execute()
+                    deleted += 1
+                    logger.info(
+                        f"Deleted:  {event.get('summary', spacex_id)} "
+                        f"(no longer in upcoming list)"
+                    )
+                except HttpError as e:
+                    logger.error(f"Delete error for {spacex_id}: {e}")
+                    errors += 1
+
+    logger.info(
+        f"Sync complete — created: {created}, updated: {updated}, "
+        f"deleted: {deleted}, errors: {errors}"
+    )
     return errors
 
 
