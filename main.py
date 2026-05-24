@@ -29,10 +29,11 @@ _root.addHandler(_fh)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SPACEX_API_URL = "https://api.spacexdata.com/v5/launches/query"
+LL2_BASE = "https://ll.thespacedevs.com/2.2.0"
+LL2_API_KEY = os.environ.get("LL2_API_KEY", "")          # optional — raises rate limit
 CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-DEFAULT_WINDOW_SECONDS = 7200
+DEFAULT_DURATION_HOURS = 2
 
 
 def get_calendar_service():
@@ -41,27 +42,21 @@ def get_calendar_service():
 
 
 def fetch_upcoming_launches() -> list[dict]:
-    payload = {
-        "query": {"upcoming": True},
-        "options": {
-            "populate": [
-                {"path": "rocket", "select": {"name": 1}},
-                {
-                    "path": "launchpad",
-                    "select": {"name": 1, "full_name": 1, "locality": 1, "region": 1},
-                },
-            ],
-            "sort": {"date_utc": "asc"},
-            "limit": 200,
-            "pagination": False,
-        },
-    }
-    resp = requests.post(SPACEX_API_URL, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict):
-        return data.get("docs", [])
-    return data
+    """Fetch all upcoming SpaceX launches from Launch Library 2."""
+    headers = {"Authorization": f"Token {LL2_API_KEY}"} if LL2_API_KEY else {}
+    url = f"{LL2_BASE}/launch/upcoming/"
+    params = {"lsp__name": "SpaceX", "format": "json", "limit": 100}
+    launches: list[dict] = []
+
+    while url:
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        launches.extend(data.get("results", []))
+        url = data.get("next")
+        params = {}  # pagination URL already includes params
+
+    return launches
 
 
 def get_existing_spacex_events(service) -> dict[str, dict]:
@@ -91,95 +86,98 @@ def get_existing_spacex_events(service) -> dict[str, dict]:
     return events
 
 
+def _precision_name(launch: dict) -> str:
+    """Return the net_precision name in lowercase, defaulting to 'hour'."""
+    prec = launch.get("net_precision") or {}
+    return (prec.get("name") or "Hour").lower()
+
+
 def build_description(launch: dict) -> str:
     lines: list[str] = []
 
-    rocket = launch.get("rocket")
-    if isinstance(rocket, dict) and rocket.get("name"):
-        lines.append(f"Rocket: {rocket['name']}")
+    # Rocket
+    rocket_cfg = (launch.get("rocket") or {}).get("configuration") or {}
+    rocket_name = rocket_cfg.get("full_name") or rocket_cfg.get("name")
+    if rocket_name:
+        lines.append(f"Rocket: {rocket_name}")
 
-    launchpad = launch.get("launchpad")
-    if isinstance(launchpad, dict):
-        parts = [
-            launchpad.get("full_name"),
-            launchpad.get("locality"),
-            launchpad.get("region"),
-        ]
-        location_str = ", ".join(p for p in parts if p)
-        if location_str:
-            lines.append(f"Launch Site: {location_str}")
+    # Launch pad
+    pad = launch.get("pad") or {}
+    pad_name = pad.get("name", "")
+    loc_name = (pad.get("location") or {}).get("name", "")
+    site = ", ".join(p for p in [pad_name, loc_name] if p)
+    if site:
+        lines.append(f"Launch Site: {site}")
 
-    flight_number = launch.get("flight_number")
-    if flight_number:
-        lines.append(f"Flight: #{flight_number}")
+    # Status + probability
+    status_name = (launch.get("status") or {}).get("name")
+    if status_name:
+        lines.append(f"Status: {status_name}")
 
-    details = launch.get("details")
-    if details:
+    probability = launch.get("probability")
+    if probability is not None:
+        lines.append(f"Launch Probability: {probability}%")
+
+    # Mission description
+    mission = launch.get("mission") or {}
+    if mission.get("description"):
         lines.append("")
-        lines.append(details)
+        lines.append(mission["description"])
 
-    links = launch.get("links", {})
+    # Video + info URLs
     link_lines: list[str] = []
-
-    webcast = links.get("webcast")
-    youtube_id = links.get("youtube_id")
-    if webcast:
-        link_lines.append(f"Webcast: {webcast}")
-    elif youtube_id:
-        link_lines.append(f"Webcast: https://www.youtube.com/watch?v={youtube_id}")
-
-    if links.get("wikipedia"):
-        link_lines.append(f"Wikipedia: {links['wikipedia']}")
-
-    reddit = links.get("reddit") or {}
-    if isinstance(reddit, dict) and reddit.get("launch"):
-        link_lines.append(f"Reddit Discussion: {reddit['launch']}")
-
-    if links.get("presskit"):
-        link_lines.append(f"Press Kit: {links['presskit']}")
-
-    if links.get("article"):
-        link_lines.append(f"Article: {links['article']}")
-
+    for v in (launch.get("vidURLs") or [])[:2]:
+        u = v.get("url") if isinstance(v, dict) else v
+        title = (v.get("title") or "Webcast") if isinstance(v, dict) else "Webcast"
+        if u:
+            link_lines.append(f"{title}: {u}")
+    for i in (launch.get("infoURLs") or [])[:2]:
+        u = i.get("url") if isinstance(i, dict) else i
+        title = (i.get("title") or "Info") if isinstance(i, dict) else "Info"
+        if u:
+            link_lines.append(f"{title}: {u}")
     if link_lines:
         lines.append("")
         lines.append("Links:")
         lines.extend(f"  {l}" for l in link_lines)
 
-    precision = launch.get("date_precision", "")
-    if precision in ("month", "quarter", "half", "year"):
+    # Precision note for non-exact dates
+    prec = _precision_name(launch)
+    if prec in ("day", "month", "quarter", "year"):
         lines.append("")
-        lines.append(f"Note: Launch date is approximate (precision: {precision}).")
+        lines.append(f"Note: Launch date is approximate (precision: {prec}).")
 
     lines.append("")
-    lines.append(f"SpaceX ID: {launch['id']}")
+    lines.append(f"Launch Library ID: {launch['id']}")
 
     return "\n".join(lines)
 
 
 def build_event(launch: dict) -> dict:
-    date_utc: str = launch.get("date_utc", "")
-    precision: str = launch.get("date_precision", "hour")
-    window_seconds: int = launch.get("window") or DEFAULT_WINDOW_SECONDS
+    net: str = launch.get("net", "")
+    window_start: str = launch.get("window_start") or net
+    window_end: str = launch.get("window_end") or ""
+    prec = _precision_name(launch)
 
-    launchpad = launch.get("launchpad")
-    location = None
-    if isinstance(launchpad, dict):
-        parts = [
-            launchpad.get("full_name"),
-            launchpad.get("locality"),
-            launchpad.get("region"),
-        ]
-        location = ", ".join(p for p in parts if p) or None
+    # Launch site for the location field
+    pad = launch.get("pad") or {}
+    pad_name = pad.get("name", "")
+    loc_name = (pad.get("location") or {}).get("name", "")
+    location = ", ".join(p for p in [pad_name, loc_name] if p) or None
 
-    if precision in ("hour", "minute"):
-        start = {"dateTime": date_utc, "timeZone": "UTC"}
-        end_dt = datetime.fromisoformat(date_utc.replace("Z", "+00:00")) + timedelta(
-            seconds=max(window_seconds, DEFAULT_WINDOW_SECONDS)
-        )
-        end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "timeZone": "UTC"}
+    if prec in ("hour", "minute", "second"):
+        start = {"dateTime": window_start, "timeZone": "UTC"}
+        if window_end and window_end != window_start:
+            end = {"dateTime": window_end, "timeZone": "UTC"}
+        else:
+            end_dt = (
+                datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+                + timedelta(hours=DEFAULT_DURATION_HOURS)
+            )
+            end = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "timeZone": "UTC"}
     else:
-        date_only = date_utc[:10]
+        # Day / month / year precision — all-day event
+        date_only = net[:10]
         start = {"date": date_only}
         end_date = (
             datetime.strptime(date_only, "%Y-%m-%d") + timedelta(days=1)
@@ -211,7 +209,7 @@ def sync_launches():
     launches = fetch_upcoming_launches()
     existing = get_existing_spacex_events(service)
     logger.info(
-        f"Fetched {len(launches)} upcoming launches; "
+        f"Fetched {len(launches)} upcoming SpaceX launches; "
         f"{len(existing)} events already in calendar"
     )
 
@@ -246,8 +244,8 @@ def sync_launches():
             errors += 1
 
     # Remove calendar events for launches no longer in the upcoming list
-    # (cancelled, scrubbed, or already flown and dropped from the API).
-    # Guard against mass-deletion if the API returned nothing.
+    # (cancelled, scrubbed, or already flown). Guard against mass-deletion
+    # if the API returned nothing.
     if launches:
         fetched_ids = {launch["id"] for launch in launches}
         for spacex_id, event in existing.items():
