@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -9,6 +9,8 @@ import requests
 from google.auth import default as google_auth_default
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+from notify import send_status_email
 
 # ── Logging — stdout + rotating file ─────────────────────────────────────────
 _log_dir = Path(__file__).parent / "logs"
@@ -268,6 +270,23 @@ def sync_launches():
         f"Sync complete — created: {created}, updated: {updated}, "
         f"deleted: {deleted}, errors: {errors}"
     )
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    status = "ERRORS" if errors else "OK"
+    send_status_email(
+        f"[SpaceX Calendar] Sync {status} — {now}",
+        "\n".join([
+            "SpaceX Calendar Sync",
+            now,
+            "",
+            f"  Fetched:  {len(launches)} upcoming launches",
+            f"  Created:  {created}",
+            f"  Updated:  {updated}",
+            f"  Deleted:  {deleted}",
+            f"  Errors:   {errors}",
+        ]),
+    )
+
     return errors
 
 
